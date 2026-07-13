@@ -1,6 +1,6 @@
 (() => {
   'use strict';
-  const PATCH_VERSION = 'v15.4';
+  const PATCH_VERSION = 'v15.5';
   const PREDICTION_KEY = 'twss-predictions-v15';
   const JOURNAL_KEY = 'twss-journal-v15';
   const patchState = { verifyQuery: '', mineTab: 'watch', backtestCache: new Map() };
@@ -219,7 +219,7 @@
     const items = getWatchlist();
     const rows = items.map(item => ({ item, stock: S.stocks.find(stock => stock.symbol === item.symbol) })).filter(row => row.stock);
     if (!rows.length) return '<div class="card empty"><h3>尚未加入自選股票</h3><p class="muted">可在機會股或股票詳細頁加入。</p></div>';
-    return `<div class="list two-col">${rows.map(({ item, stock }) => { const gain = item.addedPrice && stock.close ? (stock.close / item.addedPrice - 1) * 100 : null; return `<div class="card clickable" data-detail="${stock.symbol}"><div class="head"><div><b>${stock.name}</b><div class="muted">${stock.symbol} · ${stock.industry}</div></div><button class="icon-btn" data-watch="${stock.symbol}">移除</button></div><div class="grid">${metric('目前價格', fmt(stock.close))}${metric('加入後漲跌', `<span class="${cls(gain)}">${pct(gain)}</span>`)}${metric('月營收年增', pct(stock.rev))}${metric('機會分數', opportunityScore(stock))}</div><button class="btn" data-forecast="${stock.symbol}" style="width:100%;margin-top:10px">查看趨勢預測</button></div>`; }).join('')}</div>`;
+    return `<div class="list two-col">${rows.map(({ item, stock }) => { const gain = item.addedPrice && stock.close ? (stock.close / item.addedPrice - 1) * 100 : null; const etf = instrumentGroup(stock) === 'etf'; return `<div class="card clickable" data-detail="${stock.symbol}"><div class="head"><div><b>${stock.name}</b><div class="muted">${stock.symbol} · ${stock.industry}</div></div><button class="icon-btn" data-watch="${stock.symbol}">移除</button></div><div class="grid">${metric('目前價格', fmt(stock.close))}${metric('加入後漲跌', `<span class="${cls(gain)}">${pct(gain)}</span>`)}${metric(etf ? '商品類型' : '月營收年增', etf ? 'ETF' : pct(stock.rev))}${metric(etf ? '成交量' : '機會分數', etf ? `${fmt(stock.volume, 0)} 張` : opportunityScore(stock))}</div><button class="btn" data-forecast="${stock.symbol}" style="width:100%;margin-top:10px">查看趨勢預測</button></div>`; }).join('')}</div>`;
   }
 
   function actionLabel(value) { return ({ observe: '觀察', buy: '買入紀錄', sell: '賣出紀錄', review: '事後檢討' })[value] || value; }
@@ -289,16 +289,6 @@
     qa('[data-patch-journal-stock]').forEach(button => button.onclick = () => openJournalModal(null, S.stocks.find(stock => stock.symbol === button.dataset.patchJournalStock)));
     qa('[data-patch-verify-stock]').forEach(button => button.onclick = () => { closeModal(); patchState.verifyQuery = button.dataset.patchVerifyStock; S.tab = 'verify'; render(); });
   }
-
-  const originalDetailHtml = detailHtml;
-  detailHtml = function patchedDetailHtml(stock, historyState) {
-    let html = originalDetailHtml(stock, historyState);
-    const indicators = historyState?.indicators || null;
-    const forecast = calculateForecast(stock, indicators);
-    const extra = `<h3 class="section-title">三種預測情境</h3><div class="patch-scenarios">${scenarioHtml(stock, forecast, indicators)}</div><h3 class="section-title">大盤與產業環境</h3>${marketIndustryHtml(stock)}<h3 class="section-title">同業比較</h3>${peerHtml(stock)}<h3 class="section-title">近期事件與風險</h3>${eventHtml(stock, indicators)}<div class="row" style="margin-top:16px"><button class="btn grow" data-patch-journal-stock="${stock.symbol}">新增投資紀錄</button><button class="btn secondary" data-patch-verify-stock="${stock.symbol}">查看預測驗證</button></div>`;
-    const index = html.lastIndexOf('<div class="disclaimer">');
-    return index >= 0 ? html.slice(0, index) + extra + html.slice(index) : html.replace(/<\/div><\/div>$/, `${extra}</div></div>`);
-  };
 
   const originalOpenDetail = openDetail;
   openDetail = async function patchedOpenDetail(symbol, loadHistory = true) {

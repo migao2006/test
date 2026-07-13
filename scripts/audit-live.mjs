@@ -1,6 +1,5 @@
 const endpoints = {
   twseOpenPrice: "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-  twseInstitutional: "https://www.twse.com.tw/rwd/zh/fund/T86?response=json&selectType=ALLBUT0999",
   tpexPrice: "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
   tpexValuation: "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis",
   tpexInstitutional: "https://www.tpex.org.tw/openapi/v1/tpex_3insti_daily_trading",
@@ -17,35 +16,46 @@ const rocDate = (value) => {
 };
 
 async function get(name, url) {
-  const response = await fetch(url, {
-    headers: { accept: "application/json", "user-agent": "TaiwanStockSmartPicker-Audit/15.4" },
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`${name}: HTTP ${response.status}`);
-  return response.json();
+  try {
+    const response = await fetch(url, {
+      headers: { accept: "application/json", "user-agent": "TaiwanStockSmartPicker-Audit/15.5" },
+      signal: AbortSignal.timeout(45_000),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  } catch (error) {
+    throw new Error(`${name}: ${error?.name === 'TimeoutError' ? '45 秒逾時' : error.message}`, { cause: error });
+  }
 }
 
-const results = Object.fromEntries(
-  await Promise.all(Object.entries(endpoints).map(async ([name, url]) => [name, await get(name, url)])),
-);
+const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+const resultEntries = [];
+for (const [name, url] of Object.entries(endpoints)) {
+  if (resultEntries.length) await sleep(1300);
+  resultEntries.push([name, await get(name, url)]);
+}
+const results = Object.fromEntries(resultEntries);
 const arrays = Object.fromEntries(
   Object.entries(results).map(([name, payload]) => [name, Array.isArray(payload) ? payload : payload.data || []]),
 );
 
-const twseInstitutionalDate = rocDate(results.twseInstitutional.date);
 const tpexPriceDate = rocDate(arrays.tpexPrice[0]?.Date);
-const latestTradeDate = [twseInstitutionalDate, tpexPriceDate].filter(Boolean).sort().at(-1);
+const twseOpenPriceDate = rocDate(arrays.twseOpenPrice[0]?.Date);
+const latestTradeDate = [twseOpenPriceDate, tpexPriceDate].filter(Boolean).sort().at(-1);
 const target = latestTradeDate.replaceAll("-", "");
-const [twsePrice, twseValuation] = await Promise.all([
-  get("twsePrice", `https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${target}&type=ALLBUT0999&response=json`),
-  get("twseValuation", `https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date=${target}&selectType=ALL&response=json`),
-]);
+await sleep(1500);
+const twsePrice = await get("twsePrice", `https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?date=${target}&type=ALLBUT0999&response=json`);
+await sleep(1500);
+const twseValuation = await get("twseValuation", `https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d?date=${target}&selectType=ALL&response=json`);
+await sleep(1500);
+const twseInstitutional = await get("twseInstitutional", `https://www.twse.com.tw/rwd/zh/fund/T86?date=${target}&response=json&selectType=ALLBUT0999`);
+const twseInstitutionalDate = rocDate(twseInstitutional.date);
 
 const twsePriceTable = twsePrice.tables?.find((table) => String(table.title || "").includes("每日收盤行情"));
 const report = [
   { source: "TWSE 上市行情（指定日）", date: rocDate(twsePrice.date), rows: twsePriceTable?.data?.length || 0 },
   { source: "TWSE 上市估值（指定日）", date: rocDate(twseValuation.date), rows: twseValuation.data?.length || 0 },
-  { source: "TWSE 三大法人", date: twseInstitutionalDate, rows: results.twseInstitutional.data?.length || 0 },
+  { source: "TWSE 三大法人", date: twseInstitutionalDate, rows: twseInstitutional.data?.length || 0 },
   { source: "TWSE OpenAPI 行情備援", date: rocDate(arrays.twseOpenPrice[0]?.Date), rows: arrays.twseOpenPrice.length },
   { source: "TPEx 上櫃行情", date: tpexPriceDate, rows: arrays.tpexPrice.length },
   { source: "TPEx 上櫃估值", date: rocDate(arrays.tpexValuation[0]?.Date), rows: arrays.tpexValuation.length },

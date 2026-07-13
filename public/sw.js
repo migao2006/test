@@ -1,12 +1,12 @@
-const CACHE='twss-v15-4-sites';
+const CACHE='twss-v15-5-vercel';
 const STATIC=[
   '/',
-  '/app.js?v=15.4',
-  '/patch.js?v=15.4',
-  '/smart.js?v=15.4',
-  '/styles.css?v=15.4',
-  '/manifest.webmanifest?v=15.4',
-  '/icon.svg?v=15.4'
+  '/app.js?v=15.5',
+  '/patch.js?v=15.5',
+  '/smart.js?v=15.5',
+  '/styles.css?v=15.5',
+  '/manifest.webmanifest?v=15.5',
+  '/icon.svg?v=15.5'
 ];
 
 self.addEventListener('install',event=>event.waitUntil(
@@ -24,7 +24,7 @@ self.addEventListener('fetch',event=>{
   const url=new URL(event.request.url);
   if(url.origin!==location.origin)return;
   if(url.pathname.startsWith('/api/')){
-    event.respondWith(fetch(event.request,{cache:'no-store'}));
+    event.respondWith(fetch(event.request));
     return;
   }
   if(event.request.mode==='navigate'){

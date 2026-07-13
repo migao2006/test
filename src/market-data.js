@@ -2,7 +2,7 @@ const SUPABASE_EDGE = "https://lfkdkdyaatdlizryiyon.supabase.co/functions/v1/tws
 const TWSE_OPEN = "https://openapi.twse.com.tw/v1";
 const TWSE_WEB = "https://www.twse.com.tw";
 const TPEX_OPEN = "https://www.tpex.org.tw/openapi/v1";
-const VERSION = "15.4";
+const VERSION = "15.5";
 
 const FINANCIAL_CATEGORIES = ["ci", "fh", "basi", "bd", "ins", "mim"];
 
@@ -46,6 +46,15 @@ const industryNames = {
 let stockCache = null;
 let revenueCache = null;
 let financialCache = null;
+
+const requestQueues = new Map();
+const SOURCE_POLICIES = [
+  { match: "openapi.twse.com.tw", key: "twse-openapi", gap: 1_200, limit: 2 },
+  { match: "www.twse.com.tw", key: "twse-web", gap: 1_500, limit: 1 },
+  { match: "www.tpex.org.tw", key: "tpex-openapi", gap: 1_200, limit: 2 },
+  { match: "mops.twse.com.tw", key: "mops", gap: 1_800, limit: 1 },
+  { match: "supabase.co", key: "supabase", gap: 350, limit: 2 },
+];
 
 function pick(row, ...keys) {
   if (!row) return undefined;
@@ -155,6 +164,20 @@ function symbolOf(row) {
   );
 }
 
+function instrumentTypeOf(symbol) {
+  if (/^00\d{2,4}$/.test(symbol)) return "ETF";
+  if (/^[1-9]\d{3}$/.test(symbol)) return "股票";
+  return "其他";
+}
+
+function isSupportedSymbol(symbol) {
+  return instrumentTypeOf(symbol) !== "其他";
+}
+
+function isCompanySymbol(symbol) {
+  return instrumentTypeOf(symbol) === "股票";
+}
+
 function nameOf(row) {
   return text(
     pick(
@@ -240,7 +263,68 @@ function periodText(row) {
   return dateText(pick(row, "出表日期", "資料日期", "Date")).slice(0, 7);
 }
 
-async function fetchJson(url, timeout = 16_000) {
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function sourcePolicy(url) {
+  return (
+    SOURCE_POLICIES.find((policy) => url.includes(policy.match)) || {
+      key: "other",
+      gap: 500,
+      limit: 2,
+    }
+  );
+}
+
+function queueFor(policy) {
+  if (!requestQueues.has(policy.key)) {
+    requestQueues.set(policy.key, {
+      active: 0,
+      lastStartedAt: 0,
+      launching: false,
+      jobs: [],
+      policy,
+    });
+  }
+  return requestQueues.get(policy.key);
+}
+
+function pumpQueue(state) {
+  if (state.launching) return;
+  state.launching = true;
+  void (async () => {
+    while (state.active < state.policy.limit && state.jobs.length) {
+      const wait = Math.max(
+        0,
+        state.lastStartedAt + state.policy.gap - Date.now(),
+      );
+      if (wait) await sleep(wait);
+      const job = state.jobs.shift();
+      state.active += 1;
+      state.lastStartedAt = Date.now();
+      Promise.resolve()
+        .then(job.task)
+        .then(job.resolve, job.reject)
+        .finally(() => {
+          state.active -= 1;
+          pumpQueue(state);
+        });
+    }
+    state.launching = false;
+    if (state.active < state.policy.limit && state.jobs.length) pumpQueue(state);
+  })();
+}
+
+function scheduledRequest(url, task) {
+  const state = queueFor(sourcePolicy(url));
+  return new Promise((resolve, reject) => {
+    state.jobs.push({ task, resolve, reject });
+    pumpQueue(state);
+  });
+}
+
+async function fetchAttempt(url, timeout) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeout);
   try {
@@ -251,11 +335,38 @@ async function fetchJson(url, timeout = 16_000) {
       },
       signal: controller.signal,
     });
-    if (!response.ok) throw new Error(`Upstream ${response.status}`);
+    if (!response.ok) {
+      const error = new Error(`Upstream ${response.status}`);
+      error.status = response.status;
+      error.retryAfter = Number(response.headers.get("retry-after")) || null;
+      throw error;
+    }
     return await response.json();
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchJson(url, timeout = 24_000, retries = 2) {
+  return scheduledRequest(url, async () => {
+    let lastError;
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      try {
+        return await fetchAttempt(url, timeout);
+      } catch (error) {
+        lastError = error;
+        const retryable =
+          error?.name === "AbortError" ||
+          error?.status === 408 ||
+          error?.status === 429 ||
+          error?.status >= 500;
+        if (!retryable || attempt === retries) throw error;
+        const retryAfter = error?.retryAfter ? error.retryAfter * 1_000 : 0;
+        await sleep(Math.max(retryAfter, 1_200 * 2 ** attempt) + 150);
+      }
+    }
+    throw lastError;
+  });
 }
 
 async function fetchEdge(search, timeout = 38_000) {
@@ -441,7 +552,8 @@ function signedDifference(row) {
 
 function officialStock(row, market, maps, existing = {}) {
   const symbol = symbolOf(row);
-  if (!/^\d{4}$/.test(symbol)) return null;
+  if (!isSupportedSymbol(symbol)) return null;
+  const instrumentType = instrumentTypeOf(symbol);
   const valuation = maps.valuations.get(symbol);
   const company = maps.companies.get(symbol);
   const institutional = maps.institutional.get(symbol);
@@ -453,16 +565,20 @@ function officialStock(row, market, maps, existing = {}) {
   return {
     ...existing,
     symbol,
+    instrumentType,
     name: nameOf(row) || text(existing.name),
-    industry: industry(
-      pick(
-        company,
-        "產業別",
-        "Industry",
-        "產業類別",
-        "SecuritiesIndustryCode",
-      ) ?? existing.industry,
-    ),
+    industry:
+      instrumentType === "ETF"
+        ? "ETF"
+        : industry(
+            pick(
+              company,
+              "產業別",
+              "Industry",
+              "產業類別",
+              "SecuritiesIndustryCode",
+            ) ?? existing.industry,
+          ),
     market,
     close: prefer(close, existing.close),
     change:
@@ -518,7 +634,6 @@ async function buildStocks() {
     fetchJson(`${TWSE_OPEN}/exchangeReport/BWIBBU_ALL`),
     fetchJson(`${TWSE_OPEN}/opendata/t187ap03_L`),
     fetchJson(`${TWSE_OPEN}/exchangeReport/MI_MARGN`),
-    fetchJson(`${TWSE_WEB}/rwd/zh/fund/T86?response=json&selectType=ALLBUT0999`, 20_000),
     fetchJson(`${TPEX_OPEN}/tpex_mainboard_daily_close_quotes`),
     fetchJson(`${TPEX_OPEN}/tpex_mainboard_peratio_analysis`),
     fetchJson(`${TPEX_OPEN}/mopsfin_t187ap03_O`),
@@ -533,32 +648,30 @@ async function buildStocks() {
   const twseOpenValuations = rows(twseOpenValuationPayload);
   const twseCompanies = rows(fulfilled(initial[2], []));
   const twseOpenMargin = rows(fulfilled(initial[3], []));
-  const initialTwseInstitutionalPayload = fulfilled(initial[4], {});
-  const initialTwseInstitutional = rows(initialTwseInstitutionalPayload);
-  const tpexPricePayload = fulfilled(initial[5], []);
+  const tpexPricePayload = fulfilled(initial[4], []);
   const tpexPrices = rows(tpexPricePayload);
-  const tpexValuationPayload = fulfilled(initial[6], []);
+  const tpexValuationPayload = fulfilled(initial[5], []);
   const tpexValuations = rows(tpexValuationPayload);
-  const tpexCompanies = rows(fulfilled(initial[7], []));
-  const tpexMarginPayload = fulfilled(initial[8], []);
+  const tpexCompanies = rows(fulfilled(initial[6], []));
+  const tpexMarginPayload = fulfilled(initial[7], []);
   const tpexMargin = rows(tpexMarginPayload);
-  const tpexInstitutionalPayload = fulfilled(initial[9], []);
+  const tpexInstitutionalPayload = fulfilled(initial[8], []);
   const tpexInstitutional = rows(tpexInstitutionalPayload);
-  const edge = fulfilled(initial[10], null);
-  const edgeStocks = edge && Array.isArray(edge.stocks) ? edge.stocks : [];
+  const edge = fulfilled(initial[9], null);
+  const edgeStocks =
+    edge && Array.isArray(edge.stocks)
+      ? edge.stocks.map((stock) => ({
+          ...stock,
+          symbol: text(stock.symbol),
+          instrumentType:
+            stock.instrumentType || instrumentTypeOf(text(stock.symbol)),
+        }))
+      : [];
 
   const openTwsePriceDate = payloadDate(twseOpenPricePayload, twseOpenPrices);
-  const initialTwseInstitutionalDate = payloadDate(
-    initialTwseInstitutionalPayload,
-    initialTwseInstitutional,
-  );
   const tpexPriceDate = payloadDate(tpexPricePayload, tpexPrices);
   const tpexMarginDate = payloadDate(tpexMarginPayload, tpexMargin);
-  const targetDate = latestDate(
-    initialTwseInstitutionalDate,
-    tpexPriceDate,
-    openTwsePriceDate,
-  );
+  const targetDate = latestDate(tpexPriceDate, openTwsePriceDate);
   const target = queryDate(targetDate);
   const marginTarget = queryDate(tpexMarginDate);
 
@@ -581,12 +694,12 @@ async function buildStocks() {
           20_000,
         )
       : Promise.resolve(null),
-    target && initialTwseInstitutionalDate !== targetDate
+    target
       ? fetchJson(
           `${TWSE_WEB}/rwd/zh/fund/T86?date=${target}&response=json&selectType=ALLBUT0999`,
-          20_000,
+          45_000,
         )
-      : Promise.resolve(initialTwseInstitutionalPayload),
+      : Promise.resolve(null),
   ]);
 
   const currentTwsePricePayload = fulfilled(refreshed[0], null);
@@ -623,17 +736,14 @@ async function buildStocks() {
 
   const refreshedTwseInstitutionalPayload = fulfilled(
     refreshed[3],
-    initialTwseInstitutionalPayload,
+    null,
   );
   const refreshedTwseInstitutional = rows(refreshedTwseInstitutionalPayload);
-  const twseInstitutional =
-    refreshedTwseInstitutional.length >= 20
-      ? refreshedTwseInstitutional
-      : initialTwseInstitutional;
+  const twseInstitutional = refreshedTwseInstitutional;
   const twseInstitutionalDate =
     refreshedTwseInstitutional.length >= 20
       ? payloadDate(refreshedTwseInstitutionalPayload, refreshedTwseInstitutional)
-      : initialTwseInstitutionalDate;
+      : "";
 
   if (
     twsePrices.length < 20 &&
@@ -672,10 +782,19 @@ async function buildStocks() {
   const officialSymbols = new Set(official.map((stock) => stock.symbol));
   const fallbackOnly = edgeStocks.filter(
     (stock) =>
-      /^\d{4}$/.test(text(stock.symbol)) &&
+      isSupportedSymbol(text(stock.symbol)) &&
       !officialSymbols.has(text(stock.symbol)),
   );
   const stocks = official.length >= 20 ? [...official, ...fallbackOnly] : edgeStocks;
+  const instruments = {
+    listed: stocks.filter(
+      (stock) => stock.market === "上市" && stock.instrumentType !== "ETF",
+    ).length,
+    otc: stocks.filter(
+      (stock) => stock.market === "上櫃" && stock.instrumentType !== "ETF",
+    ).length,
+    etf: stocks.filter((stock) => stock.instrumentType === "ETF").length,
+  };
 
   const tpexValuationDate = payloadDate(
     tpexValuationPayload,
@@ -703,6 +822,7 @@ async function buildStocks() {
       otc: otc.length,
       fallback: fallbackOnly.length,
     },
+    instruments,
     dates: {
       price: {
         twse: twsePriceDate,
@@ -744,7 +864,27 @@ async function buildStocks() {
 
 function revenueFundamental(row) {
   const symbol = symbolOf(row);
-  if (!/^\d{4}$/.test(symbol)) return null;
+  if (!isCompanySymbol(symbol)) return null;
+  const rev = numeric(
+    pick(
+      row,
+      "營業收入-去年同月增減(%)",
+      "去年同月增減(%)",
+      "去年同月增減百分比",
+      "IncreaseDecreasePercentage",
+      "YoY",
+    ),
+  );
+  const revYtd = numeric(
+    pick(
+      row,
+      "累計營業收入-前期比較增減(%)",
+      "前期比較增減(%)",
+      "累計營收前期比較增減(%)",
+      "CumulativeIncreaseDecreasePercentage",
+      "YTD",
+    ),
+  );
   return {
     symbol,
     revenue: numeric(
@@ -756,16 +896,39 @@ function revenueFundamental(row) {
         "RevenueCurrentMonth",
       ),
     ),
-    rev: numeric(
+    revenuePreviousMonth: numeric(
       pick(
         row,
-        "營業收入-去年同月增減(%)",
-        "去年同月增減(%)",
-        "去年同月增減百分比",
-        "IncreaseDecreasePercentage",
-        "YoY",
+        "營業收入-上月營收",
+        "上月營收",
+        "PreviousMonthRevenue",
       ),
     ),
+    revenueLastYearMonth: numeric(
+      pick(
+        row,
+        "營業收入-去年當月營收",
+        "去年當月營收",
+        "SameMonthLastYearRevenue",
+      ),
+    ),
+    revenueYtd: numeric(
+      pick(
+        row,
+        "累計營業收入-當月累計營收",
+        "當月累計營收",
+        "CumulativeRevenueCurrentMonth",
+      ),
+    ),
+    revenueLastYearYtd: numeric(
+      pick(
+        row,
+        "累計營業收入-去年累計營收",
+        "去年累計營收",
+        "CumulativeRevenueLastYear",
+      ),
+    ),
+    rev,
     revMom: numeric(
       pick(
         row,
@@ -776,16 +939,9 @@ function revenueFundamental(row) {
         "MoM",
       ),
     ),
-    revYtd: numeric(
-      pick(
-        row,
-        "累計營業收入-前期比較增減(%)",
-        "前期比較增減(%)",
-        "累計營收前期比較增減(%)",
-        "CumulativeIncreaseDecreasePercentage",
-        "YTD",
-      ),
-    ),
+    revYtd,
+    revAcceleration:
+      rev == null || revYtd == null ? null : Number((rev - revYtd).toFixed(4)),
     revPeriod: periodText(row),
   };
 }
@@ -990,7 +1146,7 @@ async function buildFinancials() {
 
   requests.forEach((request, index) => {
     const payload = fulfilled(settled[index], []);
-    const data = rows(payload).filter((row) => /^\d{4}$/.test(symbolOf(row)));
+    const data = rows(payload).filter((row) => isCompanySymbol(symbolOf(row)));
     const date = payloadDate(payload, data);
     if (date) publicationDates[request.market].push(date);
     if (request.statement === "income") {
@@ -1056,6 +1212,12 @@ export function sourcesPayload() {
     auditedAt: "2026-07-13",
     freshnessPolicy:
       "以各來源實際回傳日期為準；上市行情優先使用指定交易日的 TWSE 盤後介面，OpenAPI 僅作備援。",
+    requestPolicy: {
+      parallelPerSource: "1–2",
+      minimumGap: "1.2–1.8 秒",
+      retries: "429、逾時及 5xx 最多重試 2 次並指數退避",
+      history: "只逐步補抓目前分組前段候選，不做全市場逐檔請求",
+    },
     sources: [
       {
         id: "twse",
@@ -1093,14 +1255,25 @@ export function healthPayload() {
       "MOPS 六類損益與資產負債資料",
       "Supabase Edge 備援",
     ],
-    markets: ["上市", "上櫃"],
+    markets: ["上市股票", "上櫃股票", "ETF"],
+    rankingGroups: {
+      listed: "上市股票獨立排名",
+      otc: "上櫃股票獨立排名",
+      etf: "ETF 獨立排名，不使用公司月營收與 ROE",
+    },
   };
 }
 
-function jsonResponse(payload, init = {}) {
+function jsonResponse(payload, init = {}, cacheSeconds = 0) {
   const headers = new Headers(init.headers || {});
   headers.set("content-type", "application/json; charset=utf-8");
   headers.set("cache-control", "no-store, max-age=0");
+  if (cacheSeconds > 0) {
+    headers.set(
+      "vercel-cdn-cache-control",
+      `public, s-maxage=${cacheSeconds}, stale-while-revalidate=${Math.max(cacheSeconds, 600)}`,
+    );
+  }
   return new Response(JSON.stringify(payload), { ...init, headers });
 }
 
@@ -1108,36 +1281,36 @@ export async function handleMarketData(request, url = new URL(request.url)) {
   const type = url.searchParams.get("type") || "stocks";
   const force = url.searchParams.get("refresh") === "1";
   try {
-    if (type === "sources") return jsonResponse(sourcesPayload());
+    if (type === "sources") return jsonResponse(sourcesPayload(), {}, 3_600);
     if (type === "revenue") {
       if (!force && revenueCache?.expires > Date.now()) {
-        return jsonResponse(revenueCache.payload);
+        return jsonResponse(revenueCache.payload, {}, 21_600);
       }
       const payload = await buildRevenue();
-      revenueCache = { payload, expires: Date.now() + 900_000 };
-      return jsonResponse(payload);
+      revenueCache = { payload, expires: Date.now() + 21_600_000 };
+      return jsonResponse(payload, {}, force ? 0 : 21_600);
     }
     if (type === "financials") {
       if (!force && financialCache?.expires > Date.now()) {
-        return jsonResponse(financialCache.payload);
+        return jsonResponse(financialCache.payload, {}, 21_600);
       }
       const payload = await buildFinancials();
-      financialCache = { payload, expires: Date.now() + 900_000 };
-      return jsonResponse(payload);
+      financialCache = { payload, expires: Date.now() + 21_600_000 };
+      return jsonResponse(payload, {}, force ? 0 : 21_600);
     }
     if (type !== "stocks") {
       const forwarded = new URLSearchParams(url.searchParams);
       forwarded.delete("_");
       forwarded.delete("refresh");
       const payload = await fetchEdge(`?${forwarded.toString()}`);
-      return jsonResponse(payload);
+      return jsonResponse(payload, {}, force ? 0 : 3_600);
     }
     if (!force && stockCache?.expires > Date.now()) {
-      return jsonResponse(stockCache.payload);
+      return jsonResponse(stockCache.payload, {}, 120);
     }
     const payload = await buildStocks();
     stockCache = { payload, expires: Date.now() + 120_000 };
-    return jsonResponse(payload);
+    return jsonResponse(payload, {}, force ? 0 : 120);
   } catch (error) {
     return jsonResponse(
       { error: error instanceof Error ? error.message : "資料取得失敗" },
@@ -1145,4 +1318,3 @@ export async function handleMarketData(request, url = new URL(request.url)) {
     );
   }
 }
-

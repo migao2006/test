@@ -1,4 +1,12 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "outputDirectory": "public",
+  "regions": ["hnd1"],
+  "functions": {
+    "api/*.js": {
+      "maxDuration": 300
+    }
+  },
   "cleanUrls": true,
   "headers": [
     {
